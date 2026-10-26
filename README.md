@@ -89,7 +89,8 @@ Scripts from external sources:
   Skip sponsor segments in YouTube videos.
 
 * thumbfast.lua ([source](https://github.com/po5/thumbfast))\
-  High-performance on-the-fly thumbnailer for mpv. **The script does not display thumbnails on its own**, it is meant to be used alongside a UI script that calls thumbfast.
+  High-performance on-the-fly thumbnailer for mpv. **The script does not display thumbnails on its own**, it is meant to be used alongside a UI script that calls thumbfast.\
+  Modified ([fork](https://github.com/RYQ-22/thumbfast)) for correct HDR thumbnails with `vo=gpu-next` and faster previews of high-resolution video. The `windows-nvidia` and `windows-intel` branches only differ in `script-opts/thumbfast.conf`: NVIDIA GPUs decode thumbnails with cuvid, Intel iGPUs use software decoding.
 
 Configuration files for these scripts can be found in the `script-opts` folder. I also modified some of these scripts' default keybindings. To see my modifications, look for script keybindings in `input.conf`.
 

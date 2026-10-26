@@ -26,8 +26,13 @@ local options = {
     -- Note that this is lower quality than increasing max_height and max_width
     scale_factor = 1,
 
-    -- Apply tone-mapping, no to disable
+    -- Apply tone-mapping, no to disable, gpu to tone-map HDR with mpv's gpu video filter
     tone_mapping = "auto",
+
+    -- Curve and parameter used by tone_mapping=gpu (the gpu filter uses mpv's legacy renderer,
+    -- so only clip, mobius, reinhard, hable, gamma, linear and bt.2390 behave differently)
+    gpu_tone_mapping = "mobius",
+    gpu_tone_mapping_param = "0.2",
 
     -- Overlay id
     overlay_id = 42,
@@ -46,6 +51,17 @@ local options = {
 
     -- Enable hardware decoding
     hwdec = false,
+
+    -- Decoder threads for the thumbnailer, 0 for auto
+    decode_threads = 2,
+
+    -- Decode with NVIDIA cuvid and downscale on the GPU before frames are copied back (NVIDIA GPUs only,
+    -- falls back to the regular decoder otherwise)
+    cuvid = false,
+
+    -- Peak brightness in nits of HDR thumbnails with tone_mapping=gpu,
+    -- auto for the display peak when mpv outputs HDR (SDR white, 203, otherwise)
+    hdr_peak = "auto",
 
     -- Windows only: use native Windows API to write to pipe (requires LuaJIT)
     direct_io = false,
@@ -67,10 +83,12 @@ function subprocess(args, async, callback)
     callback = callback or function() end
 
     if not pre_0_30_0 then
+        -- FIXME: figure out which exact env var needs to be stripped. (PR: #144, Issue: #106 and #139)
+        local env = os_name == "darwin" and "PATH="..os.getenv("PATH") or nil
         if async then
-            return mp.command_native_async({name = "subprocess", playback_only = true, args = args}, callback)
+            return mp.command_native_async({name = "subprocess", playback_only = true, args = args, env = env}, callback)
         else
-            return mp.command_native({name = "subprocess", playback_only = false, capture_stdout = true, args = args})
+            return mp.command_native({name = "subprocess", playback_only = false, capture_stdout = true, args = args, env = env})
         end
     else
         if async then
@@ -161,6 +179,8 @@ local filters_reset = {["lavfi-crop"]=true, ["crop"]=true}
 local filters_runtime = {["hflip"]=true, ["vflip"]=true}
 local filters_all = {["hflip"]=true, ["vflip"]=true, ["lavfi-crop"]=true, ["crop"]=true}
 
+local cuvid_decoders = {h264="h264_cuvid", hevc="hevc_cuvid", av1="av1_cuvid", vp9="vp9_cuvid", vp8="vp8_cuvid",
+    mpeg2video="mpeg2_cuvid", mpeg4="mpeg4_cuvid", vc1="vc1_cuvid", mjpeg="mjpeg_cuvid"}
 local tone_mappings = {["none"]=true, ["clip"]=true, ["linear"]=true, ["gamma"]=true, ["reinhard"]=true, ["hable"]=true, ["mobius"]=true}
 local last_tone_mapping
 
@@ -317,6 +337,17 @@ local function vo_tone_mapping()
     end
 end
 
+local function cuvid_decoder()
+    -- cuvid resizes before any filter runs, so skip it when cropping and for anamorphic video
+    if not options.cuvid or not effective_w or (properties["video-crop"] or "") ~= "" then return nil end
+    for _, filter in ipairs(properties["vf"] or {}) do
+        if filters_reset[filter.name] then return nil end
+    end
+    if (properties["video-out-params"] and properties["video-out-params"]["par"] or 1) ~= 1 then return nil end
+    local codec = properties["current-tracks/video"] and properties["current-tracks/video"]["codec"]
+    return cuvid_decoders[codec]
+end
+
 local function vf_string(filters, full)
     local vf = ""
     local vf_table = properties["vf"]
@@ -345,7 +376,7 @@ local function vf_string(filters, full)
         end
     end
 
-    if (full and options.tone_mapping ~= "no") or options.tone_mapping == "auto" then
+    if options.tone_mapping ~= "gpu" and ((full and options.tone_mapping ~= "no") or options.tone_mapping == "auto") then
         if properties["video-params"] and properties["video-params"]["primaries"] == "bt.2020" then
             local tone_mapping = options.tone_mapping
             if tone_mapping == "auto" then
@@ -363,7 +394,23 @@ local function vf_string(filters, full)
     end
 
     if full then
-        vf = vf.."scale=w="..effective_w..":h="..effective_h..par..",pad=w="..effective_w..":h="..effective_h..":x=-1:y=-1,format=bgra"
+        local hdr = properties["video-params"] and properties["video-params"]["primaries"] == "bt.2020"
+        if hdr and options.tone_mapping == "gpu" then
+            -- mpv's bundled FFmpeg has no zscale, so tone-map HDR with mpv's own renderer instead.
+            -- Exact seeks push every decoded frame through the filter, so downscale first unless cuvid already
+            -- did; uploading full-size frames is slow on integrated GPUs
+            if not cuvid_decoder() then
+                vf = vf.."scale=w="..(effective_w * 2)..":h="..(effective_h * 2)..","
+            end
+            -- unlike scale, the gpu filter applies the video rotation itself, so its output is already rotated
+            local gpu_w, gpu_h = effective_w, effective_h
+            if (properties["video-out-params"] and properties["video-out-params"]["rotate"] or 0) % 180 == 90 then
+                gpu_w, gpu_h = gpu_h, gpu_w
+            end
+            vf = vf.."gpu=w="..gpu_w..":h="..gpu_h..",format=bgra"
+        else
+            vf = vf.."scale=w="..effective_w..":h="..effective_h..par..",pad=w="..effective_w..":h="..effective_h..":x=-1:y=-1,format=bgra"
+        end
     end
 
     return vf
@@ -463,7 +510,7 @@ local function spawn(time)
         "--edition="..(properties["edition"] or "auto"), "--vid="..(vid or "auto"), "--no-sub", "--no-audio",
         "--start="..time, allow_fast_seek and "--hr-seek=no" or "--hr-seek=yes",
         "--ytdl-format=worst", "--demuxer-readahead-secs=0", "--demuxer-max-bytes=128KiB",
-        "--vd-lavc-skiploopfilter=all", "--vd-lavc-software-fallback=1", "--vd-lavc-fast", "--vd-lavc-threads=2", "--hwdec="..(options.hwdec and "auto" or "no"),
+        "--vd-lavc-skiploopfilter=all", "--vd-lavc-software-fallback=1", "--vd-lavc-fast", "--vd-lavc-threads="..options.decode_threads, "--hwdec="..(options.hwdec and "auto" or "no"),
         "--vf="..vf_string(filters_all, true),
         "--sws-scaler=fast-bilinear",
         "--video-rotate="..last_rotate,
@@ -476,6 +523,34 @@ local function spawn(time)
 
     if support_media_control then
         table.insert(args, "--media-controls=no")
+    end
+
+    local decoder = cuvid_decoder()
+    if decoder then
+        -- 2x the thumbnail size keeps the final downscale in the gpu/scale filter sharp
+        -- (effective size is before video-rotate, like the decoded frames)
+        table.insert(args, "--vd="..decoder..",")
+        table.insert(args, "--vd-lavc-o=resize="..(effective_w * 2).."x"..(effective_h * 2))
+    end
+
+    if options.tone_mapping == "gpu" then
+        -- vo_gpu_next composites BGRA overlays in the source video's colorspace, so encode HDR thumbnails
+        -- that way instead of as sRGB
+        local params = properties["video-params"] or {}
+        table.insert(args, "--target-trc="..(params["gamma"] or "srgb"))
+        table.insert(args, "--target-prim="..(params["primaries"] or "bt.709"))
+        local peak = 203
+        local target = properties["video-target-params"]
+        if (params["gamma"] == "pq" or params["gamma"] == "hlg") and target and (target["gamma"] == "pq" or target["gamma"] == "hlg") then
+            peak = math.floor(tonumber(options.hdr_peak) or target["max-luma"] or 203)
+            if peak > 203 then
+                -- overlays are tone-mapped from image-subs-hdr-peak (SDR white by default), which would clip them
+                mp.set_property_native("image-subs-hdr-peak", peak)
+            end
+        end
+        table.insert(args, "--target-peak="..peak)
+        table.insert(args, "--tone-mapping="..options.gpu_tone_mapping)
+        table.insert(args, "--tone-mapping-param="..options.gpu_tone_mapping_param)
     end
 
     if os_name == "darwin" and properties["macos-app-activation-policy"] then
@@ -657,7 +732,7 @@ seek_timer = mp.add_periodic_timer(seek_period, function()
         seek(allow_fast_seek)
         seek_period_counter = 1
     else
-        if seek_period_counter == 2 then
+        if seek_period_counter == 1 then
             if allow_fast_seek then
                 seek_timer:kill()
                 seek()
@@ -935,6 +1010,7 @@ mp.observe_property("demuxer-via-network", "native", update_property)
 mp.observe_property("stream-open-filename", "native", update_property)
 mp.observe_property("macos-app-activation-policy", "native", update_property)
 mp.observe_property("current-vo", "native", update_property)
+mp.observe_property("video-target-params", "native", update_property)
 mp.observe_property("video-rotate", "native", update_property)
 mp.observe_property("video-crop", "native", update_property)
 mp.observe_property("path", "native", update_property)
